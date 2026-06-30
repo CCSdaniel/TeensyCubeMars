@@ -182,9 +182,9 @@ static void printStatus() {
   Serial.print(F(" ERPM, current="));
   Serial.print(feedback.currentA, 2);
   Serial.print(F(" A, temp="));
-  Serial.print(feedback.temperatureC);
+  Serial.print(static_cast<int>(feedback.temperatureC));
   Serial.print(F(" C, error="));
-  Serial.print(feedback.errorCode);
+  Serial.print(static_cast<unsigned int>(feedback.errorCode));
   Serial.print(F(" ("));
   Serial.print(faultText(feedback.errorCode));
   Serial.print(F("), age_ms="));
@@ -203,6 +203,11 @@ static bool parseFloatAfterPrefix(const char *line, const char *prefix, float &v
 }
 
 static void executeMove(float deltaDeg) {
+  if (!isfinite(deltaDeg)) {
+    Serial.println(F("ERR movement must be a finite number"));
+    return;
+  }
+
   const float requestedTarget = targetDeg + deltaDeg;
   if (fabsf(requestedTarget) > MAX_ABS_TARGET_DEG) {
     Serial.println(F("ERR target exceeds +/-36000 deg servo-mode range"));
@@ -218,6 +223,11 @@ static void executeMove(float deltaDeg) {
 }
 
 static void executeAbsoluteTarget(float requestedTargetDeg) {
+  if (!isfinite(requestedTargetDeg)) {
+    Serial.println(F("ERR target must be a finite number"));
+    return;
+  }
+
   if (fabsf(requestedTargetDeg) > MAX_ABS_TARGET_DEG) {
     Serial.println(F("ERR target exceeds +/-36000 deg servo-mode range"));
     return;
@@ -268,7 +278,7 @@ static void handleCommand(char *line) {
   }
 
   if (parseFloatAfterPrefix(line, "speed ", value)) {
-    if (value <= 0.0f || value > 327670.0f) {
+    if (!isfinite(value) || value <= 0.0f || value > 327670.0f) {
       Serial.println(F("ERR speed must be >0 and <=327670 ERPM"));
       return;
     }
@@ -278,7 +288,7 @@ static void handleCommand(char *line) {
   }
 
   if (parseFloatAfterPrefix(line, "accel ", value)) {
-    if (value <= 0.0f || value > 327670.0f) {
+    if (!isfinite(value) || value <= 0.0f || value > 327670.0f) {
       Serial.println(F("ERR accel must be >0 and <=327670 ERPM/s"));
       return;
     }
