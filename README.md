@@ -1,10 +1,10 @@
 # TeensyCubeMars
 
 Arduino IDE project for controlling a CubeMars AK-series servo brushless motor
-from a Teensy 4.1.
+from a Teensy 4.1 using **UART/serial**, with no CAN transceiver required.
 
-The PC connects to the Teensy over USB. The Teensy sends CubeMars servo-mode
-position commands to the driver over CAN. In the Arduino IDE Serial Monitor you
+The PC connects to the Teensy over USB. The Teensy connects to the CubeMars
+driver serial port using a hardware UART. In the Arduino IDE Serial Monitor you
 can type movement commands such as:
 
 ```text
@@ -15,25 +15,24 @@ can type movement commands such as:
 The leading sign is the direction and the floating-point number is the relative
 movement angle in degrees.
 
-## Recommended communication method: CAN
+## Communication method: UART
 
-Use **CAN**, not UART, for the Teensy-to-CubeMars link.
+This project uses the CubeMars servo serial protocol:
 
-Why:
+```text
+0x02 + length + command/data payload + CRC16 + 0x03
+```
 
-- The AK-series manual describes the servo control protocol as an extended CAN
-  protocol, with position, velocity, and position-velocity modes mapped directly
-  to CAN packet IDs.
-- The CAN interface on the driver is isolated and intended for robust motor
-  control in noisy power-electronics environments.
-- CAN at 1 Mbps gives fixed 8-byte frames and no application CRC framing in the
-  Teensy sketch. The UART protocol is usable, but it requires packet framing,
-  CRC-16, and more parsing/recovery code.
-- Teensy 4.1 has built-in CAN controllers. You only need an external CAN
-  transceiver because the Teensy pins are logic-level CAN TX/RX, not CANH/CANL.
+This is the right option if you do not have a CAN transceiver. You do **not**
+need an MCP2515 module or a CANH/CANL transceiver for this UART version.
 
-UART is still useful for CubeMarsTool setup or debugging, but this project uses
-CAN for runtime movement commands.
+Tradeoffs compared with CAN:
+
+- UART wiring is simpler for one motor: TX, RX, and GND.
+- UART can request richer diagnostic values, including input voltage.
+- UART is usually less noise-resistant than CAN, so keep wiring short and away
+  from motor phase wires and high-current supply wiring.
+- UART is point-to-point. For multiple motors, CAN is still the better bus.
 
 ## Repository contents
 
@@ -47,39 +46,33 @@ TeensyCubeMarsCLI/
 - Teensy 4.1
 - CubeMars AK-series motor and matching AK-series driver board
 - Motor power supply within the driver/motor rating
-- 3.3 V CAN transceiver module capable of 1 Mbps
-  - Examples: SN65HVD230, TCAN332, MCP2562FD configured with 3.3 V logic I/O
-  - Avoid feeding 5 V logic into Teensy CAN RX
-- CAN bus termination:
-  - 120 ohm between CANH and CANL at each end of the bus
-  - For one Teensy and one driver, that normally means one termination at the
-    transceiver end and one at the driver end, if the driver does not already
-    include switchable termination
 - USB cable from PC to Teensy
+- Three signal wires for UART:
+  - Teensy TX to driver RX
+  - Teensy RX to driver TX
+  - Ground to ground
+
+No CAN transceiver is required for this version.
 
 ## Wiring
 
-### Teensy 4.1 to CAN transceiver
+The sketch uses Teensy `Serial1`.
 
-The sketch uses Teensy CAN1:
-
-| Teensy 4.1 pin | Signal | Connect to |
+| Teensy 4.1 pin | Signal | Connect to CubeMars driver |
 | --- | --- | --- |
-| 22 | CTX1 | CAN transceiver TXD |
-| 23 | CRX1 | CAN transceiver RXD |
-| 3.3 V | 3V3 | CAN transceiver VCC, if using a 3.3 V module |
-| GND | GND | CAN transceiver GND |
+| Pin 1 | TX1 | Serial RX |
+| Pin 0 | RX1 | Serial TX |
+| GND | GND | Signal/logic GND |
 
-### CAN transceiver to CubeMars driver
+Important notes:
 
-| CAN transceiver | CubeMars driver |
-| --- | --- |
-| CANH | CANH |
-| CANL | CANL |
-| GND | Driver signal/logic GND |
-
-Power the motor driver from its rated DC supply. Do **not** power the motor from
-the Teensy. Keep the motor power wiring sized for the expected current.
+- Cross TX and RX: Teensy TX goes to driver RX, and Teensy RX goes to driver TX.
+- Confirm the CubeMars driver serial voltage level before wiring. Teensy 4.1 pins
+  are **not 5 V tolerant**. If the driver TX is 5 V logic, use a level shifter
+  into Teensy RX.
+- Do not power the motor from the Teensy. The motor driver needs its rated DC
+  supply.
+- Keep UART wires short and separated from phase wires and high-current wiring.
 
 ## CubeMars driver setup
 
@@ -88,33 +81,33 @@ Use CubeMarsTool/R-link or your existing setup process before running the sketch
 1. Load/configure servo-mode firmware for the motor/driver if it is not already
    in servo mode.
 2. Calibrate the motor according to the CubeMars manual.
-3. Confirm the CAN ID. The sketch defaults to motor ID `1`.
-4. Confirm CAN bus speed is `1 Mbps` as specified by the manual.
-5. Optionally enable periodic servo feedback upload if you want the `status`
-   command to show live position/current/temperature.
+3. Confirm the driver serial/UART baud rate.
+4. Set the sketch baud rate to match the driver.
 
-If your motor ID is not `1`, edit this line in
-`TeensyCubeMarsCLI/TeensyCubeMarsCLI.ino`:
+The sketch defaults to `115200` baud for the CubeMars UART:
 
 ```cpp
-static constexpr uint8_t MOTOR_ID = 1;
+static constexpr uint32_t MOTOR_SERIAL_BAUD = 115200;
 ```
+
+If CubeMarsTool shows a different serial baud rate for your driver, update that
+constant and upload again.
 
 ## Arduino IDE configuration
 
 1. Install Arduino IDE.
 2. Install Teensyduino / Teensy board support for Arduino IDE.
-3. Install the `FlexCAN_T4` library from Arduino Library Manager if it is not
-   already available with your Teensy environment.
-4. Open `TeensyCubeMarsCLI/TeensyCubeMarsCLI.ino`.
-5. Select:
+3. Open `TeensyCubeMarsCLI/TeensyCubeMarsCLI.ino`.
+4. Select:
    - Board: `Teensy 4.1`
    - USB Type: `Serial`
    - CPU Speed: any normal Teensy 4.1 setting is fine
    - Port: the Teensy USB serial port
-6. Click Upload.
-7. Open Serial Monitor at `115200 baud`.
-8. Set line ending to `Newline` or `Both NL & CR`.
+5. Click Upload.
+6. Open Serial Monitor at `115200 baud`.
+7. Set line ending to `Newline` or `Both NL & CR`.
+
+No Arduino CAN library is needed for the UART version.
 
 ## CLI commands
 
@@ -141,11 +134,13 @@ Additional setup/debug commands:
 
 | Command | Meaning |
 | --- | --- |
+| `multi` | Set the driver position ring to multi-turn mode (`+/-100` turns) |
+| `single` | Set the driver position ring to single-turn mode (`0..360 deg`) |
 | `zero` | Set the current motor position as temporary origin and reset commanded target to `0` |
 | `target <deg>` | Command an absolute target angle from the current origin |
 | `speed <erpm>` | Set max electrical RPM used by position-velocity mode |
 | `accel <erpm/s>` | Set acceleration limit used by position-velocity mode |
-| `status` | Print last received servo feedback frame |
+| `status` | Request and print driver metrics |
 | `help` | Print command help |
 
 Default motion limits in the sketch:
@@ -158,15 +153,66 @@ static constexpr float DEFAULT_ACCEL_ERPM_S = 30000.0f;
 Start conservatively. Increase these values only after confirming the motor,
 mechanism, supply, and safety limits.
 
+## Metrics available with `status`
+
+The `status` command sends `COMM_GET_VALUES` over UART and prints the latest
+valid response.
+
+Metrics printed by the sketch:
+
+- Teensy-side commanded target angle
+- Position reported by the driver
+- Speed in ERPM
+- Input voltage
+- Output current
+- Input current
+- `Id` and `Iq` currents
+- MOS temperature
+- Motor temperature
+- Driver status/fault code
+- Motor ID reported in the values packet
+
+Example:
+
+```text
+status
+```
+
+If no response is received, check:
+
+- Driver power
+- TX/RX are crossed correctly
+- Common ground is connected
+- `MOTOR_SERIAL_BAUD` matches the driver setting
+- The driver firmware supports the servo serial protocol
+
 ## Activation sequence
 
 1. Disconnect or mechanically unload the motor while first testing if possible.
-2. Verify CANH/CANL polarity and termination.
+2. Verify TX/RX/GND wiring and voltage levels.
 3. Power the Teensy from USB.
 4. Power the CubeMars driver from the motor supply.
 5. Upload the sketch.
 6. Open Serial Monitor at `115200 baud`.
 7. Type:
+
+   ```text
+   status
+   ```
+
+   Confirm that voltage and temperature values are returned. If not, fix serial
+   wiring or baud rate before commanding motion.
+
+8. Type:
+
+   ```text
+   multi
+   ```
+
+   Multi-turn mode is recommended for signed relative movement commands. The
+   CubeMars manual describes this mode as `+/-100` turns.
+
+9. Type:
 
    ```text
    zero
@@ -175,45 +221,71 @@ mechanism, supply, and safety limits.
    This sets the current motor position as the temporary origin. Temporary origin
    is cleared when the driver loses power.
 
-8. Send a small test move:
+10. Send a small test move:
 
    ```text
    +5.0
    ```
 
-9. If the direction is correct, continue with larger commands such as:
+11. If the direction is correct, continue with larger commands such as:
 
-   ```text
-   +90.0
-   -45.5
-   ```
+    ```text
+    +90.0
+    -45.5
+    ```
 
-10. Type `status` to inspect feedback if periodic CAN feedback is enabled on the
-    driver.
+12. Type `status` again to inspect voltage, current, position, speed, and
+    temperature while testing.
 
-## CAN packet used by the sketch
+## UART packets used by the sketch
 
-The sketch uses the CubeMars servo-mode **position-velocity loop** CAN command:
+All packets are framed as:
 
-- Extended CAN ID: `(CAN_PACKET_SET_POS_SPD << 8) | MOTOR_ID`
-- `CAN_PACKET_SET_POS_SPD = 6`
-- DLC: 8 bytes
+```text
+0x02 length payload crc_high crc_low 0x03
+```
+
+CRC is CRC-16/CCITT with polynomial `0x1021` and initial value `0`.
+
+### Position-velocity command
+
+The movement commands use CubeMars `COMM_SET_POS_SPD`:
+
+- Command byte: `91` / `0x5B`
+- Payload length: 13 bytes
 - Payload:
 
 | Bytes | Value |
 | --- | --- |
-| 0..3 | target position, signed int32, degrees x 10000, big-endian |
-| 4..5 | speed limit, signed int16, ERPM / 10, big-endian |
-| 6..7 | acceleration limit, signed int16, ERPM/s / 10, big-endian |
+| 0 | `COMM_SET_POS_SPD` / `0x5B` |
+| 1..4 | target position, signed int32, degrees x 1000, big-endian |
+| 5..8 | speed limit, signed int32, ERPM, big-endian |
+| 9..12 | acceleration limit, signed int32, ERPM/s, big-endian |
 
-The sketch also parses servo feedback frames with function ID `0x29` and the
-configured motor ID:
+### Set zero/origin command
 
-- position = signed int16 x `0.1 deg`
-- speed = signed int16 x `10 ERPM`
-- current = signed int16 x `0.01 A`
-- temperature = signed int8, degrees C
-- error = CubeMars servo feedback error code
+The `zero` command sends:
+
+```text
+COMM_SET_POS_ORIGIN, 0x01
+```
+
+### Multi-turn and single-turn commands
+
+The `multi` command sends `COMM_SET_POS_MULTI` plus four zero bytes. The `single`
+command sends `COMM_SET_POS_SINGLE` plus four zero bytes.
+
+### Status command
+
+The `status` command sends:
+
+```text
+COMM_GET_VALUES
+```
+
+The response is parsed according to the CubeMars manual for MOS temperature,
+motor temperature, output/input current, `Id`/`Iq`, speed, input voltage, status
+code, outer-loop position, motor ID, and `Vd`/`Vq`.
 
 ## Safety notes
 

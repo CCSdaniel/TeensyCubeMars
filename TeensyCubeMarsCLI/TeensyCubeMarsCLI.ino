@@ -2,24 +2,20 @@
   TeensyCubeMarsCLI
 
   USB Serial CLI for a Teensy 4.1 controlling a CubeMars AK-series driver in
-  servo-mode position-velocity control over CAN.
+  servo-mode position-velocity control over UART.
 
   Primary CLI command:
     +90.0   -> move +90.0 degrees from the current commanded target
     -45.5   -> move -45.5 degrees from the current commanded target
 
   Hardware:
-    Teensy 4.1 CAN1 TX pin 22 -> 3.3 V CAN transceiver TXD
-    Teensy 4.1 CAN1 RX pin 23 -> 3.3 V CAN transceiver RXD
-    CAN transceiver CANH/CANL -> CubeMars driver CANH/CANL
-    Common GND between Teensy/transceiver and driver logic ground
-
-  Required Arduino library:
-    FlexCAN_T4
+    PC USB Serial Monitor -> Teensy USB port
+    Teensy Serial1 TX pin 1 -> CubeMars driver serial RX
+    Teensy Serial1 RX pin 0 -> CubeMars driver serial TX
+    Teensy GND -> CubeMars driver signal GND
 */
 
 #include <Arduino.h>
-#include <FlexCAN_T4.h>
 #include <ctype.h>
 #include <math.h>
 #include <stdlib.h>
@@ -27,42 +23,71 @@
 
 // -------------------------- User configuration --------------------------
 
-static constexpr uint8_t MOTOR_ID = 1;                 // CubeMars driver CAN ID
-static constexpr uint32_t CAN_BAUD = 1000000;          // AK-series servo CAN rate
-static constexpr float DEFAULT_SPEED_ERPM = 5000.0f;   // Max electrical RPM
-static constexpr float DEFAULT_ACCEL_ERPM_S = 30000.0f; // Max electrical RPM/s
-static constexpr float MAX_ABS_TARGET_DEG = 36000.0f;  // Manual position range
-static constexpr uint32_t SERIAL_BAUD = 115200;
+static constexpr uint32_t USB_SERIAL_BAUD = 115200;
+static constexpr uint32_t MOTOR_SERIAL_BAUD = 115200;  // Match CubeMarsTool/driver setting.
+static constexpr float DEFAULT_SPEED_ERPM = 5000.0f;
+static constexpr float DEFAULT_ACCEL_ERPM_S = 30000.0f;
+static constexpr float MAX_ABS_TARGET_DEG = 36000.0f;
+static constexpr uint32_t STATUS_WAIT_MS = 150;
 
-// Teensy 4.1 CAN1: CTX1 = pin 22, CRX1 = pin 23.
-FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> CanBus;
+// Teensy 4.1 Serial1: RX1 = pin 0, TX1 = pin 1.
+#define MOTOR_SERIAL Serial1
 
-enum CanPacketId : uint32_t {
-  CAN_PACKET_SET_DUTY = 0,
-  CAN_PACKET_SET_CURRENT = 1,
-  CAN_PACKET_SET_CURRENT_BRAKE = 2,
-  CAN_PACKET_SET_RPM = 3,
-  CAN_PACKET_SET_POS = 4,
-  CAN_PACKET_SET_ORIGIN_HERE = 5,
-  CAN_PACKET_SET_POS_SPD = 6,
+enum CommPacketId : uint8_t {
+  COMM_FW_VERSION = 0,
+  COMM_GET_VALUES = 4,
+  COMM_SET_DUTY = 5,
+  COMM_SET_CURRENT = 6,
+  COMM_SET_CURRENT_BRAKE = 7,
+  COMM_SET_RPM = 8,
+  COMM_SET_POS = 9,
+  COMM_ROTOR_POSITION = 22,
+  COMM_SET_POS_SPD = 91,
+  COMM_SET_POS_MULTI = 92,
+  COMM_SET_POS_SINGLE = 93,
+  COMM_SET_POS_ORIGIN = 95,
 };
 
-struct ServoFeedback {
+struct MotorMetrics {
   bool valid = false;
-  float positionDeg = 0.0f;
+  float mosTemperatureC = 0.0f;
+  float motorTemperatureC = 0.0f;
+  float outputCurrentA = 0.0f;
+  float inputCurrentA = 0.0f;
+  float idCurrentA = 0.0f;
+  float iqCurrentA = 0.0f;
+  float duty = 0.0f;
   float speedErpm = 0.0f;
-  float currentA = 0.0f;
-  int8_t temperatureC = 0;
-  uint8_t errorCode = 0;
+  float inputVoltageV = 0.0f;
+  uint8_t statusCode = 0;
+  float positionDeg = 0.0f;
+  uint8_t motorId = 0;
+  float vdVoltage = 0.0f;
+  float vqVoltage = 0.0f;
   uint32_t lastUpdateMs = 0;
 };
 
-static ServoFeedback feedback;
+enum class UartRxState : uint8_t {
+  WaitStart,
+  ReadLength,
+  ReadPayload,
+  ReadCrcHigh,
+  ReadCrcLow,
+  ReadEnd,
+};
+
+static MotorMetrics metrics;
 static float targetDeg = 0.0f;
 static float speedErpm = DEFAULT_SPEED_ERPM;
 static float accelErpmS = DEFAULT_ACCEL_ERPM_S;
 static char cliBuffer[64];
 static size_t cliLength = 0;
+
+static UartRxState uartRxState = UartRxState::WaitStart;
+static uint8_t uartRxBuffer[96];
+static uint16_t uartRxLength = 0;
+static uint16_t uartRxIndex = 0;
+static uint16_t uartRxCrc = 0;
 
 static void appendInt32(uint8_t *buffer, int32_t value, uint8_t &index) {
   buffer[index++] = static_cast<uint8_t>(value >> 24);
@@ -71,98 +96,236 @@ static void appendInt32(uint8_t *buffer, int32_t value, uint8_t &index) {
   buffer[index++] = static_cast<uint8_t>(value);
 }
 
-static void appendInt16(uint8_t *buffer, int16_t value, uint8_t &index) {
-  buffer[index++] = static_cast<uint8_t>(value >> 8);
-  buffer[index++] = static_cast<uint8_t>(value);
+static int16_t readInt16(const uint8_t *buffer, uint16_t &index) {
+  const int16_t value = static_cast<int16_t>((static_cast<uint16_t>(buffer[index]) << 8) |
+                                            static_cast<uint16_t>(buffer[index + 1]));
+  index += 2;
+  return value;
 }
 
-static int16_t toServoInt16Units(float value, float scale, int16_t minValue, int16_t maxValue) {
-  long scaled = lroundf(value / scale);
-  if (scaled < minValue) {
-    scaled = minValue;
-  } else if (scaled > maxValue) {
-    scaled = maxValue;
-  }
-  return static_cast<int16_t>(scaled);
+static int32_t readInt32(const uint8_t *buffer, uint16_t &index) {
+  const int32_t value = static_cast<int32_t>((static_cast<uint32_t>(buffer[index]) << 24) |
+                                            (static_cast<uint32_t>(buffer[index + 1]) << 16) |
+                                            (static_cast<uint32_t>(buffer[index + 2]) << 8) |
+                                            static_cast<uint32_t>(buffer[index + 3]));
+  index += 4;
+  return value;
 }
 
-static void transmitExtended(uint32_t extendedId, const uint8_t *data, uint8_t length) {
-  CAN_message_t message = {};
-  message.id = extendedId;
-  message.len = length;
-  message.flags.extended = 1;
-  message.flags.remote = 0;
+static uint16_t crc16Ccitt(const uint8_t *data, uint16_t length) {
+  uint16_t crc = 0;
 
-  for (uint8_t i = 0; i < length && i < 8; ++i) {
-    message.buf[i] = data[i];
+  for (uint16_t i = 0; i < length; ++i) {
+    crc ^= static_cast<uint16_t>(data[i]) << 8;
+    for (uint8_t bit = 0; bit < 8; ++bit) {
+      if ((crc & 0x8000) != 0) {
+        crc = static_cast<uint16_t>((crc << 1) ^ 0x1021);
+      } else {
+        crc = static_cast<uint16_t>(crc << 1);
+      }
+    }
   }
 
-  CanBus.write(message);
+  return crc;
+}
+
+static void sendPacket(const uint8_t *payload, uint16_t length) {
+  if (length == 0 || length > 255) {
+    return;
+  }
+
+  const uint16_t crc = crc16Ccitt(payload, length);
+
+  MOTOR_SERIAL.write(static_cast<uint8_t>(0x02));
+  MOTOR_SERIAL.write(static_cast<uint8_t>(length));
+  MOTOR_SERIAL.write(payload, length);
+  MOTOR_SERIAL.write(static_cast<uint8_t>(crc >> 8));
+  MOTOR_SERIAL.write(static_cast<uint8_t>(crc & 0xFF));
+  MOTOR_SERIAL.write(static_cast<uint8_t>(0x03));
+  MOTOR_SERIAL.flush();
+}
+
+static void requestValues() {
+  const uint8_t payload[] = {COMM_GET_VALUES};
+  sendPacket(payload, sizeof(payload));
 }
 
 static void setPositionVelocity(float positionDeg, float maxSpeedErpm, float maxAccelErpmS) {
-  uint8_t payload[8];
+  uint8_t payload[13];
   uint8_t index = 0;
 
-  const int32_t positionRaw = static_cast<int32_t>(lroundf(positionDeg * 10000.0f));
-  const int16_t speedRaw = toServoInt16Units(fabsf(maxSpeedErpm), 10.0f, 0, 32767);
-  const int16_t accelRaw = toServoInt16Units(fabsf(maxAccelErpmS), 10.0f, 0, 32767);
+  payload[index++] = COMM_SET_POS_SPD;
+  appendInt32(payload, static_cast<int32_t>(lroundf(positionDeg * 1000.0f)), index);
+  appendInt32(payload, static_cast<int32_t>(lroundf(fabsf(maxSpeedErpm))), index);
+  appendInt32(payload, static_cast<int32_t>(lroundf(fabsf(maxAccelErpmS))), index);
 
-  appendInt32(payload, positionRaw, index);
-  appendInt16(payload, speedRaw, index);
-  appendInt16(payload, accelRaw, index);
-
-  transmitExtended(static_cast<uint32_t>(MOTOR_ID) | (CAN_PACKET_SET_POS_SPD << 8), payload, index);
+  sendPacket(payload, index);
 }
 
 static void setCurrentPositionAsTemporaryOrigin() {
-  const uint8_t temporaryOrigin = 0;
-  transmitExtended(static_cast<uint32_t>(MOTOR_ID) | (CAN_PACKET_SET_ORIGIN_HERE << 8),
-                   &temporaryOrigin,
-                   1);
+  const uint8_t payload[] = {COMM_SET_POS_ORIGIN, 0x01};
+  sendPacket(payload, sizeof(payload));
   targetDeg = 0.0f;
 }
 
-static const char *faultText(uint8_t errorCode) {
-  switch (errorCode) {
+static void setPositionLoopMode(uint8_t command) {
+  const uint8_t payload[] = {command, 0x00, 0x00, 0x00, 0x00};
+  sendPacket(payload, sizeof(payload));
+}
+
+static const char *faultText(uint8_t statusCode) {
+  switch (statusCode) {
     case 0:
       return "none";
     case 1:
-      return "motor over-temperature";
-    case 2:
-      return "over-current";
-    case 3:
       return "over-voltage";
-    case 4:
+    case 2:
       return "under-voltage";
+    case 3:
+      return "driver fault";
+    case 4:
+      return "motor over-current";
     case 5:
-      return "encoder fault";
+      return "MOS over-temperature";
     case 6:
-      return "MOSFET over-temperature";
-    case 7:
-      return "motor stall";
+      return "motor over-temperature";
+    case 11:
+      return "encoder SPI fault";
     default:
-      return "unknown";
+      return "see CubeMars fault table";
+  }
+}
+
+static void handleMotorPacket(const uint8_t *payload, uint16_t length) {
+  if (length == 0) {
+    return;
+  }
+
+  if (payload[0] == COMM_GET_VALUES && length >= 73) {
+    uint16_t index = 1;
+
+    metrics.mosTemperatureC = static_cast<float>(readInt16(payload, index)) / 10.0f;
+    metrics.motorTemperatureC = static_cast<float>(readInt16(payload, index)) / 10.0f;
+    metrics.outputCurrentA = static_cast<float>(readInt32(payload, index)) / 100.0f;
+    metrics.inputCurrentA = static_cast<float>(readInt32(payload, index)) / 100.0f;
+    metrics.idCurrentA = static_cast<float>(readInt32(payload, index)) / 100.0f;
+    metrics.iqCurrentA = static_cast<float>(readInt32(payload, index)) / 100.0f;
+    metrics.duty = static_cast<float>(readInt16(payload, index)) / 1000.0f;
+    metrics.speedErpm = static_cast<float>(readInt32(payload, index));
+    metrics.inputVoltageV = static_cast<float>(readInt16(payload, index)) / 10.0f;
+
+    index += 24;  // Reserved bytes in the CubeMars full-values response.
+    metrics.statusCode = payload[index++];
+    metrics.positionDeg = static_cast<float>(readInt32(payload, index)) / 1000.0f;
+    metrics.motorId = payload[index++];
+
+    index += 6;  // Temperature reserved values.
+    metrics.vdVoltage = static_cast<float>(readInt32(payload, index)) / 1000.0f;
+    metrics.vqVoltage = static_cast<float>(readInt32(payload, index)) / 1000.0f;
+    metrics.valid = true;
+    metrics.lastUpdateMs = millis();
+    return;
+  }
+
+  if (payload[0] == COMM_ROTOR_POSITION && length >= 5) {
+    uint16_t index = 1;
+    metrics.positionDeg = static_cast<float>(readInt32(payload, index)) / 10000.0f;
+    metrics.valid = true;
+    metrics.lastUpdateMs = millis();
+  }
+}
+
+static void resetUartParser() {
+  uartRxState = UartRxState::WaitStart;
+  uartRxLength = 0;
+  uartRxIndex = 0;
+  uartRxCrc = 0;
+}
+
+static void processMotorByte(uint8_t byteValue) {
+  switch (uartRxState) {
+    case UartRxState::WaitStart:
+      if (byteValue == 0x02) {
+        uartRxState = UartRxState::ReadLength;
+      }
+      break;
+
+    case UartRxState::ReadLength:
+      uartRxLength = byteValue;
+      uartRxIndex = 0;
+      if (uartRxLength == 0 || uartRxLength > sizeof(uartRxBuffer)) {
+        resetUartParser();
+      } else {
+        uartRxState = UartRxState::ReadPayload;
+      }
+      break;
+
+    case UartRxState::ReadPayload:
+      uartRxBuffer[uartRxIndex++] = byteValue;
+      if (uartRxIndex >= uartRxLength) {
+        uartRxState = UartRxState::ReadCrcHigh;
+      }
+      break;
+
+    case UartRxState::ReadCrcHigh:
+      uartRxCrc = static_cast<uint16_t>(byteValue) << 8;
+      uartRxState = UartRxState::ReadCrcLow;
+      break;
+
+    case UartRxState::ReadCrcLow:
+      uartRxCrc |= byteValue;
+      uartRxState = UartRxState::ReadEnd;
+      break;
+
+    case UartRxState::ReadEnd:
+      if (byteValue == 0x03 && crc16Ccitt(uartRxBuffer, uartRxLength) == uartRxCrc) {
+        handleMotorPacket(uartRxBuffer, uartRxLength);
+      }
+      resetUartParser();
+      break;
+  }
+}
+
+static void pollMotorUart() {
+  while (MOTOR_SERIAL.available() > 0) {
+    processMotorByte(static_cast<uint8_t>(MOTOR_SERIAL.read()));
+  }
+}
+
+static void requestStatusAndWait() {
+  const uint32_t previousUpdateMs = metrics.lastUpdateMs;
+  const uint32_t requestStartMs = millis();
+
+  requestValues();
+  while (millis() - requestStartMs < STATUS_WAIT_MS) {
+    pollMotorUart();
+    if (metrics.valid && metrics.lastUpdateMs != previousUpdateMs) {
+      return;
+    }
   }
 }
 
 static void printHelp() {
   Serial.println();
-  Serial.println(F("CubeMars AK servo CLI over CAN"));
+  Serial.println(F("CubeMars AK servo CLI over UART"));
   Serial.println(F("Commands:"));
   Serial.println(F("  +<deg>       move positive relative angle, e.g. +90.0"));
   Serial.println(F("  -<deg>       move negative relative angle, e.g. -45.5"));
+  Serial.println(F("  multi        set driver position ring to multi-turn mode"));
+  Serial.println(F("  single       set driver position ring to single-turn mode"));
   Serial.println(F("  zero         set current motor position as temporary origin"));
   Serial.println(F("  target <deg> set absolute target angle from origin"));
   Serial.println(F("  speed <erpm> set position-velocity max speed"));
   Serial.println(F("  accel <e/s2> set position-velocity acceleration"));
-  Serial.println(F("  status       print last CAN feedback frame"));
+  Serial.println(F("  status       request and print voltage/current/position metrics"));
   Serial.println(F("  help         show this help"));
   Serial.println();
 }
 
 static void printStatus() {
-  Serial.print(F("target="));
+  requestStatusAndWait();
+
+  Serial.print(F("commanded_target="));
   Serial.print(targetDeg, 3);
   Serial.print(F(" deg, speed_limit="));
   Serial.print(speedErpm, 1);
@@ -170,25 +333,42 @@ static void printStatus() {
   Serial.print(accelErpmS, 1);
   Serial.println(F(" ERPM/s"));
 
-  if (!feedback.valid) {
-    Serial.println(F("feedback: no servo feedback frame received yet"));
+  if (!metrics.valid) {
+    Serial.println(F("metrics: no valid UART response yet"));
+    Serial.println(F("Check driver power, TX/RX crossing, GND, baud rate, and serial-mode firmware."));
     return;
   }
 
-  Serial.print(F("feedback: pos="));
-  Serial.print(feedback.positionDeg, 2);
+  Serial.print(F("metrics: position="));
+  Serial.print(metrics.positionDeg, 3);
   Serial.print(F(" deg, speed="));
-  Serial.print(feedback.speedErpm, 1);
-  Serial.print(F(" ERPM, current="));
-  Serial.print(feedback.currentA, 2);
-  Serial.print(F(" A, temp="));
-  Serial.print(static_cast<int>(feedback.temperatureC));
-  Serial.print(F(" C, error="));
-  Serial.print(static_cast<unsigned int>(feedback.errorCode));
+  Serial.print(metrics.speedErpm, 1);
+  Serial.print(F(" ERPM, input_voltage="));
+  Serial.print(metrics.inputVoltageV, 2);
+  Serial.println(F(" V"));
+
+  Serial.print(F("currents: output="));
+  Serial.print(metrics.outputCurrentA, 2);
+  Serial.print(F(" A, input="));
+  Serial.print(metrics.inputCurrentA, 2);
+  Serial.print(F(" A, id="));
+  Serial.print(metrics.idCurrentA, 2);
+  Serial.print(F(" A, iq="));
+  Serial.print(metrics.iqCurrentA, 2);
+  Serial.println(F(" A"));
+
+  Serial.print(F("temps: mos="));
+  Serial.print(metrics.mosTemperatureC, 1);
+  Serial.print(F(" C, motor="));
+  Serial.print(metrics.motorTemperatureC, 1);
+  Serial.print(F(" C, status="));
+  Serial.print(static_cast<unsigned int>(metrics.statusCode));
   Serial.print(F(" ("));
-  Serial.print(faultText(feedback.errorCode));
-  Serial.print(F("), age_ms="));
-  Serial.println(millis() - feedback.lastUpdateMs);
+  Serial.print(faultText(metrics.statusCode));
+  Serial.print(F("), motor_id="));
+  Serial.print(static_cast<unsigned int>(metrics.motorId));
+  Serial.print(F(", age_ms="));
+  Serial.println(millis() - metrics.lastUpdateMs);
 }
 
 static bool parseFloatAfterPrefix(const char *line, const char *prefix, float &value) {
@@ -271,6 +451,18 @@ static void handleCommand(char *line) {
     return;
   }
 
+  if (strcmp(line, "multi") == 0) {
+    setPositionLoopMode(COMM_SET_POS_MULTI);
+    Serial.println(F("OK requested multi-turn position mode"));
+    return;
+  }
+
+  if (strcmp(line, "single") == 0) {
+    setPositionLoopMode(COMM_SET_POS_SINGLE);
+    Serial.println(F("OK requested single-turn position mode"));
+    return;
+  }
+
   float value = 0.0f;
   if (parseFloatAfterPrefix(line, "target ", value)) {
     executeAbsoluteTarget(value);
@@ -331,44 +523,14 @@ static void pollSerialCli() {
   }
 }
 
-static void pollCanFeedback() {
-  CAN_message_t message = {};
-  while (CanBus.read(message)) {
-    if (!message.flags.extended || message.len < 8) {
-      continue;
-    }
-
-    const uint32_t functionId = message.id >> 8;
-    const uint8_t sourceId = static_cast<uint8_t>(message.id & 0xFF);
-    if (sourceId != MOTOR_ID || functionId != 0x29) {
-      continue;
-    }
-
-    const int16_t posRaw = static_cast<int16_t>((message.buf[0] << 8) | message.buf[1]);
-    const int16_t speedRaw = static_cast<int16_t>((message.buf[2] << 8) | message.buf[3]);
-    const int16_t currentRaw = static_cast<int16_t>((message.buf[4] << 8) | message.buf[5]);
-
-    feedback.valid = true;
-    feedback.positionDeg = static_cast<float>(posRaw) * 0.1f;
-    feedback.speedErpm = static_cast<float>(speedRaw) * 10.0f;
-    feedback.currentA = static_cast<float>(currentRaw) * 0.01f;
-    feedback.temperatureC = static_cast<int8_t>(message.buf[6]);
-    feedback.errorCode = message.buf[7];
-    feedback.lastUpdateMs = millis();
-  }
-}
-
 void setup() {
-  Serial.begin(SERIAL_BAUD);
+  Serial.begin(USB_SERIAL_BAUD);
 
-  // Give the Arduino Serial Monitor a short window to attach without blocking
-  // standalone operation.
   const uint32_t serialWaitStart = millis();
   while (!Serial && millis() - serialWaitStart < 2500) {
   }
 
-  CanBus.begin();
-  CanBus.setBaudRate(CAN_BAUD);
+  MOTOR_SERIAL.begin(MOTOR_SERIAL_BAUD);
 
   printHelp();
   Serial.println(F("Ready. Type zero after powering/enabling the driver, then send +<deg> or -<deg>."));
@@ -376,5 +538,5 @@ void setup() {
 
 void loop() {
   pollSerialCli();
-  pollCanFeedback();
+  pollMotorUart();
 }
