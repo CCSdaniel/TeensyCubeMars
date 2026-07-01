@@ -29,6 +29,8 @@ static constexpr float DEFAULT_SPEED_ERPM = 5000.0f;
 static constexpr float DEFAULT_ACCEL_ERPM_S = 30000.0f;
 static constexpr float MAX_ABS_TARGET_DEG = 36000.0f;
 static constexpr uint32_t STATUS_WAIT_MS = 150;
+static constexpr uint8_t MOTOR_UART_RX_PIN = 0;  // Teensy Serial1 RX1 pin.
+static constexpr uint8_t MOTOR_UART_TX_PIN = 1;  // Teensy Serial1 TX1 pin.
 
 // Teensy 4.1 Serial1: RX1 = pin 0, TX1 = pin 1.
 #define MOTOR_SERIAL Serial1
@@ -41,7 +43,7 @@ enum CommPacketId : uint8_t {
   COMM_SET_CURRENT_BRAKE = 7,
   COMM_SET_RPM = 8,
   COMM_SET_POS = 9,
-  COMM_ROTOR_POSITION = 22,
+  COMM_ROTOR_POSITION = 0x16,
   COMM_SET_POS_SPD = 91,
   COMM_SET_POS_MULTI = 92,
   COMM_SET_POS_SINGLE = 93,
@@ -533,6 +535,12 @@ void setup() {
   MOTOR_SERIAL.begin(MOTOR_SERIAL_BAUD);
 
   printHelp();
+  Serial.print(F("Motor UART: Serial1 RX pin "));
+  Serial.print(MOTOR_UART_RX_PIN);
+  Serial.print(F(", TX pin "));
+  Serial.print(MOTOR_UART_TX_PIN);
+  Serial.print(F(", baud "));
+  Serial.println(MOTOR_SERIAL_BAUD);
   Serial.println(F("Ready. Type zero after powering/enabling the driver, then send +<deg> or -<deg>."));
 }
 

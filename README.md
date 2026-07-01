@@ -1,7 +1,7 @@
 # TeensyCubeMars
 
 Arduino IDE project for controlling a CubeMars AK-series servo brushless motor
-from a Teensy 4.1 using **UART/serial**, with no CAN transceiver required.
+from a Teensy 4.1 using **UART/serial**.
 
 The PC connects to the Teensy over USB. The Teensy connects to the CubeMars
 driver serial port using a hardware UART. In the Arduino IDE Serial Monitor you
@@ -23,16 +23,8 @@ This project uses the CubeMars servo serial protocol:
 0x02 + length + command/data payload + CRC16 + 0x03
 ```
 
-This is the right option if you do not have a CAN transceiver. You do **not**
-need an MCP2515 module or a CANH/CANL transceiver for this UART version.
-
-Tradeoffs compared with CAN:
-
-- UART wiring is simpler for one motor: TX, RX, and GND.
-- UART can request richer diagnostic values, including input voltage.
-- UART is usually less noise-resistant than CAN, so keep wiring short and away
-  from motor phase wires and high-current supply wiring.
-- UART is point-to-point. For multiple motors, CAN is still the better bus.
+This UART version only needs TX, RX, and GND between the Teensy and the
+CubeMars driver serial port.
 
 ## Repository contents
 
@@ -52,8 +44,6 @@ TeensyCubeMarsCLI/
   - Teensy RX to driver TX
   - Ground to ground
 
-No CAN transceiver is required for this version.
-
 ## Wiring
 
 The sketch uses Teensy `Serial1`.
@@ -66,6 +56,7 @@ The sketch uses Teensy `Serial1`.
 
 Important notes:
 
+- The default sketch uses **pin 1 for TX1** and **pin 0 for RX1**.
 - Cross TX and RX: Teensy TX goes to driver RX, and Teensy RX goes to driver TX.
 - Confirm the CubeMars driver serial voltage level before wiring. Teensy 4.1 pins
   are **not 5 V tolerant**. If the driver TX is 5 V logic, use a level shifter
@@ -106,8 +97,6 @@ constant and upload again.
 5. Click Upload.
 6. Open Serial Monitor at `115200 baud`.
 7. Set line ending to `Newline` or `Both NL & CR`.
-
-No Arduino CAN library is needed for the UART version.
 
 ## CLI commands
 
