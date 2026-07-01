@@ -46,13 +46,14 @@ TeensyCubeMarsCLI/
 
 ## Wiring
 
-The sketch uses Teensy `Serial1`.
+The sketch uses Teensy `Serial1`. The CubeMars manual lists the driver serial
+connector as: pin 1 = GND, pin 2 = driver TX, pin 3 = driver RX.
 
-| Teensy 4.1 pin | Signal | Connect to CubeMars driver |
+| Teensy 4.1 board pin | Teensy signal | CubeMars serial connector |
 | --- | --- | --- |
-| Pin 1 | TX1 | Serial RX |
-| Pin 0 | RX1 | Serial TX |
-| GND | GND | Signal/logic GND |
+| Pin 1 | TX1 | Pin 3, serial RX |
+| Pin 0 | RX1 | Pin 2, serial TX |
+| GND | GND | Pin 1, serial GND |
 
 Important notes:
 
@@ -130,6 +131,7 @@ Additional setup/debug commands:
 | `speed <erpm>` | Set max electrical RPM used by position-velocity mode |
 | `accel <erpm/s>` | Set acceleration limit used by position-velocity mode |
 | `status` | Request and print driver metrics |
+| `rawstatus` | Dump raw UART bytes from a status request and parser counters |
 | `help` | Print command help |
 
 Default motion limits in the sketch:
@@ -174,6 +176,39 @@ If no response is received, check:
 - Common ground is connected
 - `MOTOR_SERIAL_BAUD` matches the driver setting
 - The driver firmware supports the servo serial protocol
+
+For lower-level troubleshooting, type:
+
+```text
+rawstatus
+```
+
+The sketch sends the manual's `COMM_GET_VALUES` request:
+
+```text
+02 01 04 40 84 03
+```
+
+Then it dumps raw RX bytes and parser counters. A normal full status response
+starts with:
+
+```text
+02 49 04 ...
+```
+
+Interpretation:
+
+- `RX bytes captured=0`: the driver is not replying. Re-check driver power,
+  CubeMars connector pinout, crossed TX/RX, common ground, baud rate, and whether
+  the driver firmware supports serial servo mode.
+- Random-looking bytes with many `crc_errors` or `bad_tail_errors`: baud rate,
+  voltage level, noise, or grounding is probably wrong.
+- Bytes arrive but do not start with `02 49 04`: the driver may be sending a
+  different serial message, such as a position-only frame, or the wrong command
+  is being triggered.
+- Valid packets increase but `status` still does not show voltage/current:
+  capture the raw bytes; the response layout may differ for that firmware and
+  the parser offsets need adjustment.
 
 ## Activation sequence
 

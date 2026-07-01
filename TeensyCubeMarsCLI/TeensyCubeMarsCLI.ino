@@ -29,6 +29,8 @@ static constexpr float DEFAULT_SPEED_ERPM = 5000.0f;
 static constexpr float DEFAULT_ACCEL_ERPM_S = 30000.0f;
 static constexpr float MAX_ABS_TARGET_DEG = 36000.0f;
 static constexpr uint32_t STATUS_WAIT_MS = 150;
+static constexpr uint32_t RAW_STATUS_WAIT_MS = 300;
+static constexpr uint16_t RAW_STATUS_MAX_BYTES = 128;
 static constexpr uint8_t MOTOR_UART_RX_PIN = 0;  // Teensy Serial1 RX1 pin.
 static constexpr uint8_t MOTOR_UART_TX_PIN = 1;  // Teensy Serial1 TX1 pin.
 
@@ -52,6 +54,7 @@ enum CommPacketId : uint8_t {
 
 struct MotorMetrics {
   bool valid = false;
+  bool valuesValid = false;
   float mosTemperatureC = 0.0f;
   float motorTemperatureC = 0.0f;
   float outputCurrentA = 0.0f;
@@ -67,6 +70,8 @@ struct MotorMetrics {
   float vdVoltage = 0.0f;
   float vqVoltage = 0.0f;
   uint32_t lastUpdateMs = 0;
+  uint32_t lastValuesUpdateMs = 0;
+  uint32_t lastPositionUpdateMs = 0;
 };
 
 enum class UartRxState : uint8_t {
@@ -90,6 +95,13 @@ static uint8_t uartRxBuffer[96];
 static uint16_t uartRxLength = 0;
 static uint16_t uartRxIndex = 0;
 static uint16_t uartRxCrc = 0;
+static uint32_t uartBytesReceived = 0;
+static uint32_t uartPacketsReceived = 0;
+static uint32_t uartCrcErrors = 0;
+static uint32_t uartBadTailErrors = 0;
+static uint32_t uartLengthErrors = 0;
+
+static void resetUartParser();
 
 static void appendInt32(uint8_t *buffer, int32_t value, uint8_t &index) {
   buffer[index++] = static_cast<uint8_t>(value >> 24);
@@ -145,6 +157,20 @@ static void sendPacket(const uint8_t *payload, uint16_t length) {
   MOTOR_SERIAL.write(static_cast<uint8_t>(crc & 0xFF));
   MOTOR_SERIAL.write(static_cast<uint8_t>(0x03));
   MOTOR_SERIAL.flush();
+}
+
+static void printHexByte(uint8_t value) {
+  if (value < 0x10) {
+    Serial.print('0');
+  }
+  Serial.print(value, HEX);
+}
+
+static void drainMotorInput() {
+  while (MOTOR_SERIAL.available() > 0) {
+    MOTOR_SERIAL.read();
+  }
+  resetUartParser();
 }
 
 static void requestValues() {
@@ -225,7 +251,9 @@ static void handleMotorPacket(const uint8_t *payload, uint16_t length) {
     metrics.vdVoltage = static_cast<float>(readInt32(payload, index)) / 1000.0f;
     metrics.vqVoltage = static_cast<float>(readInt32(payload, index)) / 1000.0f;
     metrics.valid = true;
+    metrics.valuesValid = true;
     metrics.lastUpdateMs = millis();
+    metrics.lastValuesUpdateMs = metrics.lastUpdateMs;
     return;
   }
 
@@ -234,6 +262,7 @@ static void handleMotorPacket(const uint8_t *payload, uint16_t length) {
     metrics.positionDeg = static_cast<float>(readInt32(payload, index)) / 10000.0f;
     metrics.valid = true;
     metrics.lastUpdateMs = millis();
+    metrics.lastPositionUpdateMs = metrics.lastUpdateMs;
   }
 }
 
@@ -245,6 +274,8 @@ static void resetUartParser() {
 }
 
 static void processMotorByte(uint8_t byteValue) {
+  ++uartBytesReceived;
+
   switch (uartRxState) {
     case UartRxState::WaitStart:
       if (byteValue == 0x02) {
@@ -256,6 +287,7 @@ static void processMotorByte(uint8_t byteValue) {
       uartRxLength = byteValue;
       uartRxIndex = 0;
       if (uartRxLength == 0 || uartRxLength > sizeof(uartRxBuffer)) {
+        ++uartLengthErrors;
         resetUartParser();
       } else {
         uartRxState = UartRxState::ReadPayload;
@@ -280,7 +312,12 @@ static void processMotorByte(uint8_t byteValue) {
       break;
 
     case UartRxState::ReadEnd:
-      if (byteValue == 0x03 && crc16Ccitt(uartRxBuffer, uartRxLength) == uartRxCrc) {
+      if (byteValue != 0x03) {
+        ++uartBadTailErrors;
+      } else if (crc16Ccitt(uartRxBuffer, uartRxLength) != uartRxCrc) {
+        ++uartCrcErrors;
+      } else {
+        ++uartPacketsReceived;
         handleMotorPacket(uartRxBuffer, uartRxLength);
       }
       resetUartParser();
@@ -295,16 +332,73 @@ static void pollMotorUart() {
 }
 
 static void requestStatusAndWait() {
-  const uint32_t previousUpdateMs = metrics.lastUpdateMs;
-  const uint32_t requestStartMs = millis();
+  const uint32_t previousValuesUpdateMs = metrics.lastValuesUpdateMs;
 
+  drainMotorInput();
   requestValues();
+  const uint32_t requestStartMs = millis();
   while (millis() - requestStartMs < STATUS_WAIT_MS) {
     pollMotorUart();
-    if (metrics.valid && metrics.lastUpdateMs != previousUpdateMs) {
+    if (metrics.valuesValid && metrics.lastValuesUpdateMs != previousValuesUpdateMs) {
       return;
     }
   }
+}
+
+static void printRawStatus() {
+  uint8_t captured[RAW_STATUS_MAX_BYTES];
+  uint16_t capturedCount = 0;
+  const uint32_t startBytes = uartBytesReceived;
+  const uint32_t startPackets = uartPacketsReceived;
+  const uint32_t startCrcErrors = uartCrcErrors;
+  const uint32_t startBadTailErrors = uartBadTailErrors;
+  const uint32_t startLengthErrors = uartLengthErrors;
+
+  drainMotorInput();
+
+  Serial.println(F("TX COMM_GET_VALUES: 02 01 04 40 84 03"));
+  requestValues();
+  const uint32_t requestStartMs = millis();
+
+  while (millis() - requestStartMs < RAW_STATUS_WAIT_MS) {
+    while (MOTOR_SERIAL.available() > 0) {
+      const uint8_t byteValue = static_cast<uint8_t>(MOTOR_SERIAL.read());
+      if (capturedCount < RAW_STATUS_MAX_BYTES) {
+        captured[capturedCount++] = byteValue;
+      }
+      processMotorByte(byteValue);
+    }
+  }
+
+  Serial.print(F("RX bytes captured="));
+  Serial.print(capturedCount);
+  Serial.print(F(" over "));
+  Serial.print(RAW_STATUS_WAIT_MS);
+  Serial.println(F(" ms"));
+
+  if (capturedCount > 0) {
+    for (uint16_t i = 0; i < capturedCount; ++i) {
+      if (i % 16 == 0) {
+        Serial.println();
+      } else {
+        Serial.print(' ');
+      }
+      printHexByte(captured[i]);
+    }
+    Serial.println();
+  }
+
+  Serial.print(F("Parser delta: bytes="));
+  Serial.print(uartBytesReceived - startBytes);
+  Serial.print(F(", valid_packets="));
+  Serial.print(uartPacketsReceived - startPackets);
+  Serial.print(F(", crc_errors="));
+  Serial.print(uartCrcErrors - startCrcErrors);
+  Serial.print(F(", bad_tail_errors="));
+  Serial.print(uartBadTailErrors - startBadTailErrors);
+  Serial.print(F(", length_errors="));
+  Serial.println(uartLengthErrors - startLengthErrors);
+  Serial.println(F("Expected full status response starts with: 02 49 04 ..."));
 }
 
 static void printHelp() {
@@ -320,6 +414,7 @@ static void printHelp() {
   Serial.println(F("  speed <erpm> set position-velocity max speed"));
   Serial.println(F("  accel <e/s2> set position-velocity acceleration"));
   Serial.println(F("  status       request and print voltage/current/position metrics"));
+  Serial.println(F("  rawstatus    dump raw UART bytes for status troubleshooting"));
   Serial.println(F("  help         show this help"));
   Serial.println();
 }
@@ -335,9 +430,10 @@ static void printStatus() {
   Serial.print(accelErpmS, 1);
   Serial.println(F(" ERPM/s"));
 
-  if (!metrics.valid) {
-    Serial.println(F("metrics: no valid UART response yet"));
+  if (!metrics.valuesValid) {
+    Serial.println(F("metrics: no valid COMM_GET_VALUES response yet"));
     Serial.println(F("Check driver power, TX/RX crossing, GND, baud rate, and serial-mode firmware."));
+    Serial.println(F("Type rawstatus to see the raw UART response bytes and parser counters."));
     return;
   }
 
@@ -370,7 +466,7 @@ static void printStatus() {
   Serial.print(F("), motor_id="));
   Serial.print(static_cast<unsigned int>(metrics.motorId));
   Serial.print(F(", age_ms="));
-  Serial.println(millis() - metrics.lastUpdateMs);
+  Serial.println(millis() - metrics.lastValuesUpdateMs);
 }
 
 static bool parseFloatAfterPrefix(const char *line, const char *prefix, float &value) {
@@ -444,6 +540,11 @@ static void handleCommand(char *line) {
 
   if (strcmp(line, "status") == 0) {
     printStatus();
+    return;
+  }
+
+  if (strcmp(line, "rawstatus") == 0) {
+    printRawStatus();
     return;
   }
 
